@@ -1,0 +1,321 @@
+package tui
+
+import (
+	"strings"
+	"testing"
+
+	tea "github.com/charmbracelet/bubbletea"
+
+	"github.com/keyolk/ghx/internal/config"
+	"github.com/keyolk/ghx/internal/gh"
+	"github.com/keyolk/ghx/internal/pr"
+)
+
+// Acting on a PR straight from the list is the point of these keys, but the
+// cursor moves under the same fingers that press them — so the tests below pin
+// down both that the actions reach the right PR and that none of them fire
+// without an explicit confirmation.
+
+func testApp(t *testing.T, rows []pr.Summary) *App {
+	t.Helper()
+	cfg := config.DefaultConfig()
+	cfg.Sources = []config.SourceDef{{Name: "test", Query: "state:open"}}
+	a := NewApp(cfg, DefaultKeymap(), gh.NewClient(0))
+	a.width, a.height = 160, 40
+	a.list.caches[0] = rows
+	a.list.syncListItems()
+	return a
+}
+
+func keyMsg(s string) tea.KeyMsg {
+	if len(s) == 1 {
+		return tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(s)}
+	}
+	switch s {
+	case "enter":
+		return tea.KeyMsg{Type: tea.KeyEnter}
+	case "esc":
+		return tea.KeyMsg{Type: tea.KeyEsc}
+	case "space":
+		return tea.KeyMsg{Type: tea.KeySpace}
+	}
+	return tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune(s)}
+}
+
+var sampleRows = []pr.Summary{
+	{Number: 101, Title: "first pr", Repo: "acme/one", State: "OPEN"},
+	{Number: 202, Title: "second pr", Repo: "acme/two", State: "OPEN"},
+}
+
+// The action must apply to the row under the cursor, not the first row or the
+// last one acted on.
+func TestListActionTargetsSelectedRow(t *testing.T) {
+	a := testApp(t, sampleRows)
+
+	got, ok := a.currentTarget()
+	if !ok {
+		t.Fatal("no target for the first row")
+	}
+	if got.number != 101 || got.repo != "acme/one" {
+		t.Errorf("target = #%d in %s, want #101 in acme/one", got.number, got.repo)
+	}
+
+	a.list.list.Select(1)
+	got, ok = a.currentTarget()
+	if !ok {
+		t.Fatal("no target after moving the cursor")
+	}
+	if got.number != 202 || got.repo != "acme/two" {
+		t.Errorf("target = #%d in %s, want #202 in acme/two", got.number, got.repo)
+	}
+}
+
+// Approve and close must not act on the first keypress. This is the property
+// that makes the keys safe to have in a list you scroll through.
+func TestDestructiveListActionsAskFirst(t *testing.T) {
+	for _, key := range []string{"a", "x"} {
+		t.Run(key, func(t *testing.T) {
+			a := testApp(t, sampleRows)
+			cmd, handled := a.prActionKey(keyMsg(key))
+			if !handled {
+				t.Fatalf("%q was not handled in the list", key)
+			}
+			if cmd != nil {
+				t.Errorf("%q returned a command instead of only opening a prompt", key)
+			}
+			if a.confirm == nil {
+				t.Fatalf("%q did not raise a confirmation", key)
+			}
+			if a.confirm.target.number != 101 {
+				t.Errorf("prompt targets #%d, want #101", a.confirm.target.number)
+			}
+		})
+	}
+}
+
+// Only y proceeds; every other key must leave the PR untouched.
+func TestConfirmOnlyProceedsOnYes(t *testing.T) {
+	for _, key := range []string{"n", "esc", "j", "a", "space"} {
+		t.Run("dismiss with "+key, func(t *testing.T) {
+			a := testApp(t, sampleRows)
+			a.prActionKey(keyMsg("a"))
+			if a.confirm == nil {
+				t.Fatal("no prompt to dismiss")
+			}
+			cmd := a.handleConfirmKey(keyMsg(key))
+			if cmd != nil {
+				t.Errorf("%q produced an action; only y may act", key)
+			}
+		})
+	}
+
+	a := testApp(t, sampleRows)
+	a.prActionKey(keyMsg("a"))
+	if cmd := a.handleConfirmKey(keyMsg("y")); cmd == nil {
+		t.Error("y should run the approve")
+	}
+	if a.confirm != nil {
+		t.Error("the prompt should close once answered")
+	}
+}
+
+// An unknown key inside the prompt must not dismiss it either — the prompt has
+// to stay until answered, or a stray keystroke silently cancels the intent.
+func TestConfirmIgnoresUnrelatedKeys(t *testing.T) {
+	a := testApp(t, sampleRows)
+	a.prActionKey(keyMsg("a"))
+	a.handleConfirmKey(keyMsg("k"))
+	if a.confirm == nil {
+		t.Error("an unrelated key should neither act nor dismiss the prompt")
+	}
+}
+
+// A closed PR reopens rather than closes: offering "close" on something already
+// closed would be a no-op the user has to discover by doing it.
+func TestCloseKeyReopensClosedPR(t *testing.T) {
+	a := testApp(t, []pr.Summary{
+		{Number: 303, Title: "closed pr", Repo: "acme/one", State: "CLOSED"},
+	})
+	a.prActionKey(keyMsg("x"))
+	if a.confirm == nil {
+		t.Fatal("no prompt raised")
+	}
+	if a.confirm.kind != confirmReopen {
+		t.Errorf("kind = %v, want confirmReopen for a closed PR", a.confirm.kind)
+	}
+	out := a.renderConfirm(120, 20)
+	if !contains(out, "Reopen") {
+		t.Errorf("prompt should say reopen: %s", out)
+	}
+}
+
+// The prompt names the PR so a mis-selected row can be caught before acting.
+func TestConfirmPromptNamesThePR(t *testing.T) {
+	a := testApp(t, sampleRows)
+	a.list.list.Select(1)
+	a.prActionKey(keyMsg("a"))
+	out := a.renderConfirm(140, 20)
+	if !contains(out, "#202") || !contains(out, "acme/two") {
+		t.Errorf("prompt must identify the PR: %s", out)
+	}
+	if !contains(out, "second pr") {
+		t.Errorf("prompt should show the title: %s", out)
+	}
+}
+
+// `l` is the vim right-alias that opens the preview pane; the label picker must
+// not steal it. `o` folds a file inside the diff tab and must not be stolen
+// either — both were real regressions when the actions were first wired up.
+func TestActionKeysDoNotStealNavigationKeys(t *testing.T) {
+	a := testApp(t, sampleRows)
+	if _, handled := a.prActionKey(keyMsg("l")); handled {
+		t.Error("lowercase l must stay the preview/right key")
+	}
+	if _, handled := a.prActionKey(keyMsg("L")); !handled {
+		t.Error("L should open the label picker")
+	}
+}
+
+func TestDiffTabKeepsFoldKey(t *testing.T) {
+	a := testApp(t, sampleRows)
+	a.state = viewPRDetail
+	a.detail = newPRDetailModel(a.cfg, a.client, a.km, 101, "acme/one")
+	a.detail.activeTab = tabDiff
+	if err := a.detail.diff.setContent(threadsDiff, nil); err != nil {
+		t.Fatalf("setContent: %v", err)
+	}
+	a.detail.diff.cursor = 0 // file header
+
+	before := len(a.detail.diff.rows)
+	a.handleKey(keyMsg("o"))
+	if len(a.detail.diff.rows) >= before {
+		t.Error("o should still fold the file in the diff tab, not open a browser")
+	}
+}
+
+// The label picker stages edits and submits adds and removes together; nothing
+// should be sent when the user only looked.
+func TestLabelPickerSubmitsOnlyRealChanges(t *testing.T) {
+	a := testApp(t, sampleRows)
+	a.openLabelPicker(actionTarget{number: 101, repo: "acme/one"})
+	p := a.labels
+	p.loading = false
+	p.all = []gh.RepoLabel{{Name: "bug"}, {Name: "docs"}, {Name: "keep"}}
+	p.applied = map[string]bool{"keep": true}
+
+	// Toggling something on and back off is not a change.
+	p.pending["bug"] = true
+	p.pending["bug"] = false
+	if p.dirty() {
+		t.Error("toggling a label on and off again should leave nothing to submit")
+	}
+
+	p.pending["bug"] = true   // add
+	p.pending["keep"] = false // remove
+	add, remove := p.diff()
+	if strings.Join(add, ",") != "bug" {
+		t.Errorf("add = %v, want [bug]", add)
+	}
+	if strings.Join(remove, ",") != "keep" {
+		t.Errorf("remove = %v, want [keep]", remove)
+	}
+
+	// Submitting with nothing staged closes the picker without a request.
+	p.pending = map[string]bool{}
+	if cmd := a.submitLabels(); cmd != nil {
+		t.Error("an unchanged picker should not send a request")
+	}
+	if a.labels != nil {
+		t.Error("the picker should close on submit")
+	}
+}
+
+// The picker shows what is already on the PR, so the user is not re-adding
+// labels blind.
+func TestLabelPickerMarksAppliedLabels(t *testing.T) {
+	a := testApp(t, sampleRows)
+	a.openLabelPicker(actionTarget{number: 101, repo: "acme/one"})
+	a.labels.loading = false
+	a.labels.all = []gh.RepoLabel{{Name: "bug", Description: "a defect"}, {Name: "docs"}}
+	a.labels.applied = map[string]bool{"bug": true}
+
+	out := a.renderLabelPicker(120, 24)
+	if !contains(out, "bug") || !contains(out, "docs") {
+		t.Errorf("picker should list the repo labels: %s", out)
+	}
+	if !contains(out, iconCheck) {
+		t.Errorf("an applied label needs a mark: %s", out)
+	}
+	if !contains(out, "#101") {
+		t.Errorf("picker should name the PR it edits: %s", out)
+	}
+}
+
+func TestLabelPickerFilters(t *testing.T) {
+	a := testApp(t, sampleRows)
+	a.openLabelPicker(actionTarget{number: 101, repo: "acme/one"})
+	p := a.labels
+	p.loading = false
+	p.all = []gh.RepoLabel{{Name: "bug"}, {Name: "documentation"}, {Name: "duplicate"}}
+
+	p.query = "du"
+	names := []string{}
+	for _, l := range p.visible() {
+		names = append(names, l.Name)
+	}
+	if strings.Join(names, ",") != "duplicate" {
+		t.Errorf("filter 'du' matched %v, want [duplicate]", names)
+	}
+
+	// Filtering must not leave the cursor past the end of the shorter list.
+	p.cursor = 2
+	p.query = "zzz"
+	if len(p.visible()) != 0 {
+		t.Fatal("expected no matches")
+	}
+	if out := a.renderLabelPicker(120, 24); !contains(out, "no labels match") {
+		t.Errorf("an empty filter result should say so: %s", out)
+	}
+}
+
+// With no rows there is nothing to act on; the keys must report that rather
+// than acting on a zero-valued target.
+func TestListActionsWithEmptyList(t *testing.T) {
+	a := testApp(t, nil)
+	if _, ok := a.currentTarget(); ok {
+		t.Error("an empty list should yield no target")
+	}
+	cmd, handled := a.prActionKey(keyMsg("a"))
+	if !handled {
+		t.Fatal("the key should still be consumed")
+	}
+	if cmd == nil {
+		t.Error("expected an error message, got no command")
+	}
+	if a.confirm != nil {
+		t.Error("no prompt should open without a target")
+	}
+}
+
+// Requesting changes needs a reason, so it opens the composer — and the composer
+// has to carry the PR, because the list has no detail model to fall back on.
+func TestRequestChangesFromListCarriesPR(t *testing.T) {
+	a := testApp(t, sampleRows)
+	a.list.list.Select(1)
+	cmd, handled := a.prActionKey(keyMsg("r"))
+	if !handled || cmd == nil {
+		t.Fatal("r should open the composer")
+	}
+	msg := cmd()
+	open, ok := msg.(openComposerMsg)
+	if !ok {
+		t.Fatalf("got %T, want openComposerMsg", msg)
+	}
+	if open.target.review != "request-changes" {
+		t.Errorf("review = %q, want request-changes", open.target.review)
+	}
+	if open.target.prNumber != 202 || open.target.repo != "acme/two" {
+		t.Errorf("composer target = #%d in %s, want #202 in acme/two",
+			open.target.prNumber, open.target.repo)
+	}
+}

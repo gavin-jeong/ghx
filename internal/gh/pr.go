@@ -1,0 +1,111 @@
+package gh
+
+import (
+	"context"
+	"fmt"
+	"strings"
+
+	"github.com/keyolk/ghx/internal/pr"
+)
+
+// ListPRs lists a single repository's PRs via `gh pr list`.
+//
+// Qualifiers that gh models as flags (state:, author:, assignee:, label:, base:,
+// draft:) are lifted out of the query so they go down the plain REST listing
+// path. Anything left over is passed via --search, which is more expressive but
+// spends the GraphQL search budget — worth avoiding for the common cases.
+func (c *Client) ListPRs(ctx context.Context, query string, limit int) ([]pr.Summary, error) {
+	if limit <= 0 {
+		limit = 30
+	}
+	flags, leftover := listQueryArgs(query)
+	args := []string{"pr", "list"}
+	args = append(args, flags...)
+	if leftover != "" {
+		args = append(args, "--search", leftover)
+	}
+	args = append(args,
+		"--json", "number,title,author,state,isDraft,reviewDecision,headRefName,updatedAt",
+		"--limit", fmt.Sprintf("%d", limit),
+	)
+	var out []pr.Summary
+	if err := c.execJSON(ctx, &out, args...); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+// listQueryArgs splits a query into gh pr list flags plus the unhandled remainder.
+func listQueryArgs(query string) (flags []string, leftover string) {
+	var rest []string
+	for _, tok := range strings.Fields(query) {
+		key, val, ok := strings.Cut(tok, ":")
+		if !ok {
+			rest = append(rest, tok)
+			continue
+		}
+		switch strings.ToLower(key) {
+		case "state", "is":
+			switch strings.ToLower(val) {
+			case "open", "closed", "merged", "all":
+				flags = append(flags, "--state", strings.ToLower(val))
+			case "draft":
+				flags = append(flags, "--draft")
+			default:
+				rest = append(rest, tok)
+			}
+		case "author":
+			flags = append(flags, "--author", val)
+		case "assignee":
+			flags = append(flags, "--assignee", val)
+		case "label":
+			flags = append(flags, "--label", val)
+		case "base":
+			flags = append(flags, "--base", val)
+		case "head":
+			flags = append(flags, "--head", val)
+		default:
+			// review-requested:, mentions:, and friends have no flag on gh pr
+			// list, so they have to go through --search.
+			rest = append(rest, tok)
+		}
+	}
+	return flags, strings.Join(rest, " ")
+}
+
+// ViewPR runs `gh pr view N --json ...` and returns the full PR detail.
+func (c *Client) ViewPR(ctx context.Context, number int) (*pr.Detail, error) {
+	args := []string{
+		"pr", "view", fmt.Sprintf("%d", number),
+		"--json", "number,title,body,author,state,isDraft,baseRefName,headRefName," +
+			"additions,deletions,changedFiles,mergeable,mergeStateStatus,reviewDecision," +
+			"labels,reviewRequests,reviews,commits,files,url",
+	}
+	var out pr.Detail
+	if err := c.execJSON(ctx, &out, args...); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// PRDiff runs `gh pr diff N` and returns the raw unified diff text.
+func (c *Client) PRDiff(ctx context.Context, number int) (string, error) {
+	out, err := c.exec(ctx, "pr", "diff", fmt.Sprintf("%d", number))
+	if err != nil {
+		return "", err
+	}
+	return string(out), nil
+}
+
+// PRChecks runs `gh pr checks N --json ...`.
+func (c *Client) PRChecks(ctx context.Context, number int) ([]pr.Check, error) {
+	args := []string{
+		"pr", "checks", fmt.Sprintf("%d", number),
+		"--json", "bucket,name,state,link,workflow,event,startedAt,completedAt",
+	}
+	var out []pr.Check
+	if err := c.execJSON(ctx, &out, args...); err != nil {
+		return nil, err
+	}
+	return out, nil
+}

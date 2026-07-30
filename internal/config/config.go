@@ -1,0 +1,207 @@
+// Package config loads ~/.config/ghx/config.yaml with defaults for PR list
+// sources, keymap overrides, color overrides, editor, and poll interval.
+package config
+
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+
+	"github.com/keyolk/ghx/internal/pr"
+	"gopkg.in/yaml.v3"
+)
+
+// Config is the loaded ghx configuration.
+type Config struct {
+	Sources        []SourceDef     `yaml:"sources"`
+	Keymap         KeymapOverrides `yaml:"keymap"`
+	Colors         ColorOverrides  `yaml:"colors"`
+	Editor         string          `yaml:"editor"`
+	PollInterval   string          `yaml:"poll_interval"`
+	DiffSplitRatio int             `yaml:"diff_split_ratio"`
+
+	// DetectRepo leads the PR list with the repository the launch directory (or
+	// the current tmux pane) belongs to. Set it to false to always open on the
+	// configured sources — useful when ghx is run from inside one repo but used
+	// mainly to triage a cross-repo queue.
+	DetectRepo *bool `yaml:"detect_repo"`
+
+	// Derived (not YAML). PollInterval parsed into a duration.
+	pollDuration time.Duration
+}
+
+// SourceDef is one PR list tab: a named gh search query, optionally scoped.
+type SourceDef struct {
+	Name  string `yaml:"name"`
+	Query string `yaml:"query"`
+	Repo  string `yaml:"repo"` // optional "owner/repo"
+}
+
+// KeymapOverrides is a placeholder for per-key YAML overrides (Phase 6).
+type KeymapOverrides map[string]string
+
+// ColorOverrides maps semantic token names to hex strings (Phase 7).
+type ColorOverrides map[string]string
+
+// Path returns the config file path (~/.config/ghx/config.yaml).
+func Path() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, ".config", "ghx", "config.yaml"), nil
+}
+
+// Load reads the config file. A missing file returns DefaultConfig (no error).
+// A malformed file returns an error plus the defaults so the caller can proceed.
+func Load() (*Config, error) {
+	cfg := DefaultConfig()
+	p, err := Path()
+	if err != nil {
+		return cfg, err
+	}
+	data, err := os.ReadFile(p)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return cfg, nil
+		}
+		return cfg, fmt.Errorf("read config %s: %w", p, err)
+	}
+	var file Config
+	if err := yaml.Unmarshal(data, &file); err != nil {
+		return cfg, fmt.Errorf("parse config %s: %w", p, err)
+	}
+	merge(cfg, &file)
+	return cfg, nil
+}
+
+// DefaultConfig returns the built-in defaults.
+func DefaultConfig() *Config {
+	return &Config{
+		Sources: []SourceDef{
+			{Name: "My reviews", Query: "review-requested:@me state:open"},
+			{Name: "Assigned to me", Query: "assignee:@me state:open"},
+			{Name: "Mentioned", Query: "mentions:@me state:open"},
+		},
+		Editor:         "", // resolve from $EDITOR or "vi" at use site
+		PollInterval:   "30s",
+		DiffSplitRatio: 40,
+	}
+}
+
+// merge overlays non-empty file fields onto defaults.
+func merge(dst *Config, file *Config) {
+	if len(file.Sources) > 0 {
+		dst.Sources = file.Sources
+	}
+	if len(file.Keymap) > 0 {
+		dst.Keymap = file.Keymap
+	}
+	if len(file.Colors) > 0 {
+		dst.Colors = file.Colors
+	}
+	if file.Editor != "" {
+		dst.Editor = file.Editor
+	}
+	if file.PollInterval != "" {
+		dst.PollInterval = file.PollInterval
+	}
+	if file.DiffSplitRatio > 0 {
+		dst.DiffSplitRatio = file.DiffSplitRatio
+	}
+	// A pointer distinguishes "absent" from "explicitly false", so setting
+	// detect_repo: false actually turns the behaviour off.
+	if file.DetectRepo != nil {
+		dst.DetectRepo = file.DetectRepo
+	}
+}
+
+// Marshal renders the config as YAML, for `ghx config view|init`.
+func (c *Config) Marshal() ([]byte, error) {
+	return yaml.Marshal(c)
+}
+
+// RepoDetectionEnabled reports whether the PR list should lead with the
+// repository the user is in. It defaults to true: opening on the repo you are
+// standing in is what makes the tool feel aware of context, and the configured
+// sources are still one keystroke away.
+func (c *Config) RepoDetectionEnabled() bool {
+	if c.DetectRepo == nil {
+		return true
+	}
+	return *c.DetectRepo
+}
+
+// EffectiveSources returns the source tabs to show, leading with the repository
+// the user is currently in when one was detected.
+//
+// The detected repo goes first because that is almost always what the user came
+// to look at; the configured sources follow unchanged, so the wider queue is
+// still one keystroke away. A configured source already scoped to that repo is
+// used as-is rather than duplicated.
+func (c *Config) EffectiveSources(detectedRepo string) []SourceDef {
+	base := c.Sources
+	if len(base) == 0 {
+		base = DefaultConfig().Sources
+	}
+	if detectedRepo == "" || !c.RepoDetectionEnabled() {
+		return base
+	}
+	// An existing tab for this repo is promoted instead of adding a second one.
+	for i, s := range base {
+		if strings.EqualFold(s.Repo, detectedRepo) {
+			out := make([]SourceDef, 0, len(base))
+			out = append(out, base[i])
+			out = append(out, base[:i]...)
+			out = append(out, base[i+1:]...)
+			return out
+		}
+	}
+	current := SourceDef{
+		Name:  shortRepoName(detectedRepo),
+		Query: "state:open",
+		Repo:  detectedRepo,
+	}
+	return append([]SourceDef{current}, base...)
+}
+
+// shortRepoName labels the detected tab. Within one org the owner repeats on
+// every tab and only costs width, so it is dropped unless the name would be
+// ambiguous on its own.
+func shortRepoName(slug string) string {
+	_, name, ok := strings.Cut(slug, "/")
+	if !ok || name == "" {
+		return slug
+	}
+	return name
+}
+
+// PollDuration returns the parsed poll interval, defaulting to 30s.
+func (c *Config) PollDuration() time.Duration {
+	if c.pollDuration > 0 {
+		return c.pollDuration
+	}
+	d, err := time.ParseDuration(c.PollInterval)
+	if err != nil || d <= 0 {
+		d = 30 * time.Second
+	}
+	c.pollDuration = d
+	return d
+}
+
+// EditorCommand resolves the editor command: config > $EDITOR > "vi".
+func (c *Config) EditorCommand() string {
+	if c.Editor != "" {
+		return c.Editor
+	}
+	if e := os.Getenv("EDITOR"); e != "" {
+		return e
+	}
+	return "vi"
+}
+
+// Ensure pr.Summary is referenced so the import stays valid even if the
+// package grows. (Keeps go vet happy in Phase 1.)
+var _ = pr.Summary{}
