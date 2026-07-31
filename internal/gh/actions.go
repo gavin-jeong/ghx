@@ -4,114 +4,120 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"strings"
-
-	"github.com/keyolk/ghx/internal/pr"
 )
 
-// Actions that operate on a PR without opening it. These exist so the list view
-// can act on a row directly; each takes the number explicitly rather than
-// relying on a checkout, because ghx runs outside any repository.
+// Actions API wrappers. `gh run` and `gh workflow` cover most of it; the rest
+// goes through `gh api` against the Actions REST endpoints.
 
-// Close closes a PR. comment, when non-empty, is posted first so the close has
-// a stated reason — a silent close leaves the author guessing.
-func (c *Client) Close(ctx context.Context, number int, comment string) error {
-	args := []string{"pr", "close", fmt.Sprintf("%d", number)}
-	if comment != "" {
-		args = append(args, "--comment", comment)
+// Run is a workflow run, repo-wide (not tied to a PR).
+type Run struct {
+	DatabaseID   int64  `json:"databaseId"`
+	DisplayTitle string `json:"displayTitle"`
+	Status       string `json:"status"`      // queued, in_progress, completed
+	Conclusion   string `json:"conclusion"`   // success, failure, cancelled, null
+	Event        string `json:"event"`        // push, pull_request, schedule, ...
+	HeadBranch   string `json:"headBranch"`
+	WorkflowName string `json:"workflowName"`
+	CreatedAt    string `json:"createdAt"`
+	URL          string `json:"url"`
+}
+
+// ListRuns returns recent workflow runs for the repository.
+func (c *Client) ListRuns(ctx context.Context, limit int) ([]Run, error) {
+	if limit <= 0 {
+		limit = 30
 	}
-	_, err := c.exec(ctx, args...)
+	out, err := c.exec(ctx, "run", "list",
+		"--json", "databaseId,displayTitle,status,conclusion,event,headBranch,workflowName,createdAt,url",
+		"--limit", fmt.Sprintf("%d", limit))
+	if err != nil {
+		return nil, err
+	}
+	return decodeJSON[[]Run](out)
+}
+
+// RerunRun triggers a full rerun of a workflow run.
+func (c *Client) RerunRun(ctx context.Context, runID string) error {
+	_, err := c.exec(ctx, "run", "rerun", runID)
 	return err
 }
 
-// Reopen reopens a closed PR.
-func (c *Client) Reopen(ctx context.Context, number int) error {
-	_, err := c.exec(ctx, "pr", "reopen", fmt.Sprintf("%d", number))
+// RerunFailedJobs reruns only the failed jobs of a workflow run.
+func (c *Client) RerunFailedJobs(ctx context.Context, runID string) error {
+	_, err := c.exec(ctx, "run", "rerun", runID, "--failed")
 	return err
 }
 
-// AddLabels attaches labels to a PR. gh takes them as a repeated flag.
-func (c *Client) AddLabels(ctx context.Context, number int, labels []string) error {
-	if len(labels) == 0 {
-		return fmt.Errorf("no labels given")
-	}
-	args := []string{"pr", "edit", fmt.Sprintf("%d", number)}
-	for _, l := range labels {
-		args = append(args, "--add-label", l)
-	}
-	_, err := c.exec(ctx, args...)
+// CancelRun cancels an in-progress workflow run.
+func (c *Client) CancelRun(ctx context.Context, runID string) error {
+	_, err := c.exec(ctx, "run", "cancel", runID)
 	return err
 }
 
-// RemoveLabels detaches labels from a PR.
-func (c *Client) RemoveLabels(ctx context.Context, number int, labels []string) error {
-	if len(labels) == 0 {
-		return fmt.Errorf("no labels given")
+// Workflow is a repository workflow file.
+type Workflow struct {
+	ID   int64  `json:"id"`
+	Name string `json:"name"`
+	Path string `json:"path"`
+	State string `json:"state"` // active, disabled_manually, disabled_inactivity
+}
+
+// ListWorkflows returns the repository's workflow files.
+func (c *Client) ListWorkflows(ctx context.Context) ([]Workflow, error) {
+	out, err := c.execRaw(ctx, "api",
+		fmt.Sprintf("repos/%s/actions/workflows?per_page=100", c.repoPath()))
+	if err != nil {
+		return nil, err
 	}
-	args := []string{"pr", "edit", fmt.Sprintf("%d", number)}
-	for _, l := range labels {
-		args = append(args, "--remove-label", l)
+	var v struct {
+		Workflows []Workflow `json:"workflows"`
 	}
-	_, err := c.exec(ctx, args...)
+	if err := json.Unmarshal(out, &v); err != nil {
+		return nil, fmt.Errorf("decode workflows: %w", err)
+	}
+	return v.Workflows, nil
+}
+
+// EnableWorkflow re-enables a disabled workflow.
+func (c *Client) EnableWorkflow(ctx context.Context, workflowID string) error {
+	_, err := c.exec(ctx, "workflow", "enable", workflowID)
 	return err
 }
 
-// RepoLabel is a label available in the repository.
-type RepoLabel struct {
+// DisableWorkflow disables an active workflow.
+func (c *Client) DisableWorkflow(ctx context.Context, workflowID string) error {
+	_, err := c.exec(ctx, "workflow", "disable", workflowID)
+	return err
+}
+
+// RunDetail holds a single run's jobs for the detail view.
+type RunJobDetail struct {
+	DatabaseID  int64  `json:"databaseId"`
 	Name        string `json:"name"`
-	Description string `json:"description"`
-	Color       string `json:"color"`
+	Status      string `json:"status"`
+	Conclusion  string `json:"conclusion"`
+	StartedAt   string `json:"startedAt"`
+	CompletedAt string `json:"completedAt"`
+	URL         string `json:"htmlUrl"`
 }
 
-// RepoLabels lists the labels defined in the repo, for the label picker.
-func (c *Client) RepoLabels(ctx context.Context) ([]RepoLabel, error) {
-	out, err := c.exec(ctx, "label", "list", "--limit", "200",
-		"--json", "name,description,color")
+// RunDetail returns a run's metadata and jobs.
+type RunDetail struct {
+	DatabaseID   int64         `json:"databaseId"`
+	DisplayTitle string        `json:"displayTitle"`
+	Status       string        `json:"status"`
+	Conclusion   string        `json:"conclusion"`
+	Event        string        `json:"event"`
+	HeadBranch   string        `json:"headBranch"`
+	Jobs         []RunJobDetail `json:"jobs"`
+}
+
+// ViewRun returns a run's details including its jobs.
+func (c *Client) ViewRun(ctx context.Context, runID string) (*RunDetail, error) {
+	out, err := c.exec(ctx, "run", "view", runID,
+		"--json", "databaseId,displayTitle,status,conclusion,event,headBranch,jobs")
 	if err != nil {
 		return nil, err
 	}
-	var labels []RepoLabel
-	if err := json.Unmarshal(out, &labels); err != nil {
-		return nil, fmt.Errorf("decode labels: %w", err)
-	}
-	return labels, nil
-}
-
-// PRLabels returns the labels currently on a PR, so a picker can show what is
-// already applied instead of re-adding it.
-func (c *Client) PRLabels(ctx context.Context, number int) ([]string, error) {
-	out, err := c.exec(ctx, "pr", "view", fmt.Sprintf("%d", number), "--json", "labels")
-	if err != nil {
-		return nil, err
-	}
-	var v struct {
-		Labels []pr.Label `json:"labels"`
-	}
-	if err := json.Unmarshal(out, &v); err != nil {
-		return nil, fmt.Errorf("decode pr labels: %w", err)
-	}
-	names := make([]string, 0, len(v.Labels))
-	for _, l := range v.Labels {
-		names = append(names, l.Name)
-	}
-	return names, nil
-}
-
-// PRPermalink returns the web URL for a PR, used by the browser action when the
-// list row did not carry one.
-func (c *Client) PRPermalink(ctx context.Context, number int) (string, error) {
-	out, err := c.exec(ctx, "pr", "view", fmt.Sprintf("%d", number), "--json", "url")
-	if err != nil {
-		return "", err
-	}
-	var v struct {
-		URL string `json:"url"`
-	}
-	if err := json.Unmarshal(out, &v); err != nil {
-		return "", fmt.Errorf("decode pr url: %w", err)
-	}
-	if v.URL == "" {
-		return "", fmt.Errorf("pull request %d has no url", number)
-	}
-	return strings.TrimSpace(v.URL), nil
+	return decodeJSON[*RunDetail](out)
 }

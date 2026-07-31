@@ -40,6 +40,10 @@ func run() (err error) {
 			return nil
 		case "config":
 			return runConfig(os.Args[2:])
+		case "admin":
+			return runSubcommand(os.Args[2:], "admin")
+		case "actions":
+			return runSubcommand(os.Args[2:], "actions")
 		}
 	}
 

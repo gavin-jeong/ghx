@@ -13,9 +13,14 @@ func printUsage() {
 	fmt.Print(`ghx — review GitHub pull requests in the terminal
 
 Usage:
-  ghx                 open the review TUI
+  ghx                 open the PR review TUI
+  ghx admin           manage a repository (collaborators, branches, releases, …)
+  ghx actions         manage GitHub Actions (runs, workflows, logs)
   ghx config <cmd>    inspect or edit configuration
   ghx version         print the version
+
+Options:
+  --repo owner/name   target repository (default: detected from cwd or tmux)
 
 Config commands:
   ghx config path     print the config file path
